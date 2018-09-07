@@ -1,0 +1,19 @@
+{
+  "name": "server-ambr",
+  "version": "1.0.0",
+  "description": "Node server for ambr",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "charity"
+  ],
+  "author": "ambr.nick@gmail.com",
+  "license": "ISC",
+  "dependencies": {
+    "jsonwebtoken": "^8.3.0",
+    "mongodb": "^3.1.4",
+    "secure-password": "^3.1.0"
+  }
+}
