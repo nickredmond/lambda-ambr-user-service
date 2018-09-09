@@ -43,7 +43,7 @@ function decryptConnectionString(connectionString, onSuccess, onError) {
 
 function processEvent(event, context, callback) {
     console.log("calling Atlas from Lambda with event: " + JSON.stringify(event));
-    var userRequest = JSON.parse(event.body);
+    var userRequest = JSON.parse(JSON.stringify(event));
     context.callbackWaitsForEmptyEventLoop = false;
 
     try {
@@ -51,11 +51,11 @@ function processEvent(event, context, callback) {
             console.log("=> connecting to database");
             MongoClient.connect(atlas_connection_uri, function(err, client) {
                 cachedDb = client.db("ambr");
-                return evaluateRequestType(cachedDb, query, callback);
+                return evaluateRequestType(cachedDb, userRequest, callback);
             });
         }
         else {
-            evaluateRequestType(cachedDb, query, callback);
+            evaluateRequestType(cachedDb, userRequest, callback);
         }
     }
     catch (err) {
@@ -66,34 +66,41 @@ function processEvent(event, context, callback) {
 function evaluateRequestType(db, userRequest, callback) {
     if (userRequest.requestType === "register") {
         const user = userRequest.user;
-        registerUser(user);
+        registerUser(db, user, callback);
     }
     else if (userRequest.requestType === "login") {
         const user = userRequest.user;
-        logIn(user);
+        logIn(db, user, callback);
     }
     else if (userRequest.requestType === "reset") {
         const email = userRequest.emailAddress;
-        resetPassword(email);
+        resetPassword(db, email, callback);
     }
     else {
-        console.err("Unidentified request type: " + JSON.stringify(userRequest.requestType));
+        console.error("Unidentified request type: " + JSON.stringify(userRequest.requestType));
     }
 }
 
 function registerUser(db, user, callback) {
-    const existingUser = getUserByEmail(db, user.emailAddress);
-
-    if (existingUser) {
-        const errorResponse = {
-            message: "Could not create new user. User already exists.",
-            isUserAlreadyExists: true
-        };
-        sendResponseToApiGateway(JSON.stringify(errorResponse), 400, callback);
-    }
-    else {
-        saveNewUser(db, user, callback);
-    }
+    getUserByEmail(db, user.emailAddress, 
+        (existingUser) => {
+            if (existingUser) {
+                const errorResponse = {
+                    message: "Could not create new user. User already exists.",
+                    isUserAlreadyExists: true
+                };
+                sendResponseToApiGateway(JSON.stringify(errorResponse), 400, callback);
+            }
+            else {
+                saveNewUser(db, user, callback);
+            }
+        },
+        (error) => {
+            sendResponseToApiGateway("ERROR verifying user does not exist.", 500, callback);
+        }
+    );
+    
+    
 }
 function saveNewUser(db, user, callback) {
     const passwordPolicy = securePassword();
@@ -105,7 +112,7 @@ function saveNewUser(db, user, callback) {
         }
         else {
             try {
-                db.collection("users").insertOne({ email: user.emailAddress, passwordHash: hash });
+                db.collection("users").insertOne({ email: user.emailAddress, passwordHash: hash.toString("base64") });
                 setApiToken(db, user, callback);
             } catch(err) {
                 sendResponseToApiGateway("ERROR registering new user - record could not inserted.", 500, callback);
@@ -115,40 +122,46 @@ function saveNewUser(db, user, callback) {
 }
 
 function logIn(db, user, callback) {
-    const existingUser = getUserByEmail(db, user.emailAddress);
-
-    if (existingUser) {
-        const passwordPolicy = securePassword();
-        const userPassword = Buffer.from(user.password);
-
-        passwordPolicy.verify(userPassword, existingUser.passwordHash, function(err, result) {
-            if (err) {
-                sendResponseToApiGateway("ERROR logging in - password verification process failed.", 500, callback);
-            } else if (result === securePassword.VALID) {
-                setApiToken(db, user, callback);
-            } else if (result === securePassword.VALID_NEEDS_REHASH) {
-                passwordPolicy.hash(userPassword, function(err, improvedHash) {
-                    if (!err) {
-                        db.collection("users").updateOne(
-                            { email: user.emailAddress },
-                            { $set: { passwordHash: improvedHash } }
-                        );
+    const existingUser = getUserByEmail(db, user.emailAddress, 
+        (existingUser) => {
+            if (existingUser) {
+                const passwordPolicy = securePassword();
+                const userPasswordBuffer = Buffer.from(user.password);
+                const passwordHashBuffer = Buffer.from(existingUser.passwordHash, "base64");
+        
+                passwordPolicy.verify(userPasswordBuffer, passwordHashBuffer, function(err, result) {
+                    if (err) {
+                        sendResponseToApiGateway("ERROR logging in - password verification process failed.", 500, callback);
+                    } else if (result === securePassword.VALID) {
+                        setApiToken(db, user, callback);
+                    } else if (result === securePassword.VALID_NEEDS_REHASH) {
+                        passwordPolicy.hash(userPasswordBuffer, function(err, improvedHash) {
+                            if (!err) {
+                                db.collection("users").updateOne(
+                                    { email: user.emailAddress },
+                                    { $set: { passwordHash: improvedHash.toString("base64") } }
+                                );
+                            }
+                            setApiToken(db, user, callback);
+                        });
                     }
-                    setApiToken(db, user, callback);
+                    else {
+                        sendResponseToApiGateway("ERROR logging in - unauthenticated.", 401, callback);
+                    }
                 });
             }
             else {
-                sendResponseToApiGateway("ERROR logging in - unauthenticated.", 401, callback);
+                const errorResponse = {
+                    message: "Could not log in. No user exists with that email.",
+                    isUserNotFound: true
+                };
+                sendResponseToApiGateway(JSON.stringify(errorResponse), 400, callback);
             }
-        });
-    }
-    else {
-        const errorResponse = {
-            message: "Could not log in. No user exists with that email.",
-            isUserNotFound: true
-        };
-        sendResponseToApiGateway(JSON.stringify(errorResponse), 400, callback);
-    }
+        },
+        (error) => {
+            sendResponseToApiGateway("ERROR verifying user exists during login.", 500, callback);
+        }
+    );
 }
 function setApiToken(db, user, callback) {
     const JWT_SECRET_KEY = process.env["JWT_SECRET_KEY"];
@@ -176,32 +189,17 @@ function resetPassword(db, email, callback) {
     // todo: send email after saving hash of reset token
 }
 
-function getUserByEmail(db, emailAddress) {
-    return db.collection("users").findOne({ email: { $eq: emailAddress } });
+function getUserByEmail(db, emailAddress, onSuccess, onError) {
+    db.collection("users").findOne({ email: { $eq: emailAddress } }, function(err, user) {
+        if (err) {
+            onError(err);
+        } else if (user) {
+            onSuccess(user);
+        } else {
+            onSuccess(null);
+        }
+    });
 }
-
-// function queryCharities(db, query, callback) {
-//     db.collection("charities").find({}).toArray(function(err, result) {
-//         if (err != null) {
-//             console.error("error occurred in queryCharities", err);
-//             sendResponseToApiGateway(JSON.stringify(err), callback);
-//         }
-//         else {
-//             console.log("SUCCESS. found charities.");
-//             const queryText = (query && query.text) ? query.text.toLowerCase() : null;
-//             let queryResult = !(query && query.text) ? result : result.filter((charity) => {
-//                 // TODO: add description to query, weight results based on name(1), keywords(2), description(3)
-//                 return charity.name.toLowerCase().includes(queryText) || charity.keywords.includes(queryText);
-//             });
-            
-//             const skip = (query && query.skip) ? query.skip : 0;
-//             const take = (query && query.take) ? query.take : 10;
-//             queryResult = skipAndTake(queryResult, skip, take);
-            
-//             sendResponseToApiGateway(queryResult, callback);
-//         }
-//     });
-// }
 
 function sendClientErrorToApiGateway(errorMessage, callback) {
     sendResponseToApiGateway(errorMessage, 400, callback);
