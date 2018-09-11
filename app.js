@@ -112,8 +112,25 @@ function saveNewUser(db, user, callback) {
         }
         else {
             try {
-                db.collection("users").insertOne({ email: user.emailAddress, passwordHash: hash.toString("base64") });
-                setApiToken(db, user, callback);
+                const userToInsert = { 
+                    email: user.emailAddress, 
+                    passwordHash: hash.toString("base64"), 
+                    bidPermissions: []
+                };
+
+                db.collection("users").insertOne(
+                    userToInsert,
+                    function(err) {
+                        if (err) {
+                            sendResponseToApiGateway("ERROR saving new user.", 500, callback);
+                        } else {
+                            console.log("User record added: " + userToInsert._id.toString());
+                            user.bidPermissions = [];
+                            user.id = userToInsert._id.toString();
+                            setApiToken(db, user, callback);
+                        }
+                    }
+                );
             } catch(err) {
                 sendResponseToApiGateway("ERROR registering new user - record could not inserted.", 500, callback);
             }
@@ -129,6 +146,8 @@ function logIn(db, user, callback) {
                 const userPasswordBuffer = Buffer.from(user.password);
                 const passwordHashBuffer = Buffer.from(existingUser.passwordHash, "base64");
         
+                user.bidPermissions = existingUser.bidPermissions;
+                user.id = existingUser._id.toString();
                 passwordPolicy.verify(userPasswordBuffer, passwordHashBuffer, function(err, result) {
                     if (err) {
                         sendResponseToApiGateway("ERROR logging in - password verification process failed.", 500, callback);
@@ -178,7 +197,9 @@ function setApiToken(db, user, callback) {
 
             const successfulResponse = {
                 isUserLoggedIn: true,
-                apiToken: apiToken
+                apiToken: apiToken,
+                userId: user.id,
+                bidPermissions: user.bidPermissions
             };
             sendDataToApiGateway(successfulResponse, callback);
         }
